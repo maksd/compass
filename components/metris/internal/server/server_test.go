@@ -60,7 +60,7 @@ F9tLfqf1VyOeX2JirKXo+vkVWddXySAUd1GIMa0A485ts8RbpquhmVx7va7o7CDI
 -----END RSA PRIVATE KEY-----`)
 
 func newTestServer(c Config) (testserver *httptest.Server, server *Server, err error) {
-	server, err = NewServer(c, zap.NewNop().Sugar())
+	server, err = NewServer(c, zap.NewNop().Sugar(), nil)
 	if err != nil {
 		return
 	}

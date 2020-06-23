@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 
 	"github.com/alecthomas/kong"
@@ -16,6 +16,13 @@ import (
 	"github.com/mitchellh/go-homedir"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"k8s.io/klog"
+
+	// import to initialize prometheus registry.
+	_ "github.com/kyma-incubator/compass/components/metris/internal/metrics"
+
+	// import to initialize provider.
+	_ "github.com/kyma-incubator/compass/components/metris/internal/provider/azure"
 )
 
 var (
@@ -24,13 +31,13 @@ var (
 )
 
 type app struct {
-	Version        kong.VersionFlag `kong:"help='Print version information and quit.'"`
-	ConfigFile     kong.ConfigFlag  `kong:"help='Location of the config file.',type='path'"`
-	LogLevel       string           `kong:"help='Logging level. (${enum})',enum='${loglevels}',default='info',env='METRIS_LOGLEVEL'"`
-	Kubeconfig     string           `kong:"help='Path to the Gardener kubeconfig file.',required=true,default='${kubeconfig}',env='METRIS_KUBECONFIG'"`
-	ServerConfig   server.Config    `kong:"embed=true"`
-	ProviderConfig provider.Config  `kong:"embed=true,prefix='provider-'"`
 	EDPConfig      edp.Config       `kong:"embed=true,prefix='edp-'"`
+	ProviderConfig provider.Config  `kong:"embed=true,prefix='provider-'"`
+	ServerConfig   server.Config    `kong:"embed=true"`
+	ConfigFile     kong.ConfigFlag  `kong:"help='Location of the config file.',type='path'"`
+	Kubeconfig     string           `kong:"help='Path to the Gardener kubeconfig file.',required=true,default='${kubeconfig}',env='METRIS_KUBECONFIG'"`
+	LogLevel       zap.AtomicLevel  `kong:"help='Logging level. (${loglevels})',default='info',env='METRIS_LOGLEVEL'"`
+	Version        kong.VersionFlag `kong:"help='Print version information and quit.'"`
 }
 
 func main() {
@@ -59,53 +66,66 @@ func main() {
 			"kubeconfig": kubeconfig,
 			"loglevels":  "debug,info,warn,error",
 		},
+		kong.TypeMapper(reflect.TypeOf(zap.AtomicLevel{}), utils.LogLevelDecoder()),
 		kong.Configuration(kong.JSON, ""),
 	)
 
-	var logger *zap.SugaredLogger
+	var slogger *zap.SugaredLogger
 	{
-		var loglevel zapcore.Level
-		err = loglevel.UnmarshalText([]byte(cli.LogLevel))
-		if err != nil {
-			loglevel = zapcore.InfoLevel
+		var cfg zap.Config
+		if version == "dev" {
+			cfg = zap.NewDevelopmentConfig()
+		} else {
+			cfg = zap.NewProductionConfig()
+			cfg.DisableCaller = true
+		}
+		cfg.Level = cli.LogLevel
+		logger, logerr := cfg.Build()
+		if logerr != nil {
+			panic(logerr)
 		}
 
-		encoderConfig := zap.NewProductionEncoderConfig()
-		encoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-		encoderConfig.EncodeLevel = zapcore.LowercaseColorLevelEncoder
+		// capture standard golang "log" package output and force it through this logger
+		_ = zap.RedirectStdLog(logger)
 
-		encoder := zapcore.NewConsoleEncoder(encoderConfig)
-		core := zapcore.NewCore(encoder, zapcore.Lock(os.Stderr), loglevel)
-		logger = zap.New(core).Sugar()
+		// capture klog logs and write them at debug level because some dependencies are using it
+		if loggerwriter, logerr := zap.NewStdLogAt(logger, zapcore.DebugLevel); logerr == nil {
+			klog.SetOutput(loggerwriter.Writer())
+		}
+
+		slogger = logger.Sugar()
 	}
 
-	eventsChannel := make(chan *[]byte, cli.EDPConfig.Buffer)
-	accountsChannel := make(chan *gardener.Account, cli.ProviderConfig.Buffer)
-
+	clusterChannel := make(chan *gardener.Cluster, cli.ProviderConfig.Buffer)
+	eventChannel := make(chan *edp.Event, cli.EDPConfig.Buffer)
 	wg := sync.WaitGroup{}
 
-	edpclient := edp.NewClient(&cli.EDPConfig, nil, eventsChannel, logger)
+	edpclient := edp.NewClient(&cli.EDPConfig, nil, eventChannel, slogger.Named("edp"))
 
 	go edpclient.Run(ctx, &wg)
 
-	// start provider to begin fetching metrics from account sent by the controller
-	pro, err := provider.NewProvider(&cli.ProviderConfig, accountsChannel, eventsChannel, logger)
+	// start provider to fetch metrics from the clusters
+	cli.ProviderConfig.ClusterChannel = clusterChannel
+	cli.ProviderConfig.EventsChannel = eventChannel
+	cli.ProviderConfig.Logger = slogger.Named(cli.ProviderConfig.Type)
+	prov, err := provider.GetProvider(&cli.ProviderConfig)
 	clictx.FatalIfErrorf(err)
 
-	go pro.Collect(ctx, &wg)
+	go prov.Run(ctx, &wg)
 
-	// start gardener controller to watch on shoots and secrets changes and send them to the provider to process
+	// start gardener controller to sync clusters with provider
 	gclient, err := gardener.NewClient(cli.Kubeconfig)
 	clictx.FatalIfErrorf(err)
 
-	ctrl, err := gardener.NewController(gclient, cli.ProviderConfig.Type, accountsChannel, logger)
+	ctrl, err := gardener.NewController(gclient, cli.ProviderConfig.Type, clusterChannel, slogger.Named("gardener"))
 	clictx.FatalIfErrorf(err)
 
 	go ctrl.Run(ctx, &wg)
 
 	// start web server for metris metrics and profiling
 	if len(cli.ServerConfig.ListenAddr) > 0 {
-		s, err := server.NewServer(cli.ServerConfig, logger)
+		s, err := server.NewServer(cli.ServerConfig, slogger.Named("metris"), cli.LogLevel.ServeHTTP)
+
 		clictx.FatalIfErrorf(err)
 
 		go s.Start(ctx, &wg)
@@ -117,9 +137,9 @@ func main() {
 
 	wg.Wait()
 
-	logger.Info("metris stopped")
+	slogger.Info("metris stopped")
 
-	if loggererr := logger.Sync(); loggererr != nil {
+	if loggererr := slogger.Sync(); loggererr != nil {
 		fmt.Println(loggererr)
 	}
 }

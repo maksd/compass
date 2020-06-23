@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net/http"
 	"net/http/pprof"
 	"sync"
@@ -42,22 +43,27 @@ var defaultCurves = []tls.CurveID{
 }
 
 type Config struct {
-	ListenAddr  string `kong:"help='Address and port for the server to listen on.',env='METRIS_LISTENADDR',required=true"`
-	TLSCertFile string `kong:"help='Path to TLS certificate file.',type='path',env='METRIS_TLSCERTFILE'"`
-	TLSKeyFile  string `kong:"help='Path to TLS key file.',type='path',env='METRIS_TLSKEYFILE'"`
+	ListenAddr   string `kong:"help='Address and port for the server to listen on.',env='METRIS_LISTENADDR',required=true"`
+	TLSCertFile  string `kong:"help='Path to TLS certificate file.',type='path',env='METRIS_TLSCERTFILE'"`
+	TLSKeyFile   string `kong:"help='Path to TLS key file.',type='path',env='METRIS_TLSKEYFILE'"`
+	ProfilerPort int    `kong:"help='Port to expose debugging information.',optional=true,env='METRIS_PROFILER_PORT'"`
 }
 
 // Server represents an HTTP server
 type Server struct {
-	Server  *http.Server
-	Healthy int32
-	useTLS  bool
-	logger  *zap.SugaredLogger
+	Server          *http.Server
+	ProfServer      *http.Server
+	Healthy         int32
+	useTLS          bool
+	logger          *zap.SugaredLogger
+	loglevelHandler func(w http.ResponseWriter, r *http.Request)
 }
 
-func NewServer(c Config, logger *zap.SugaredLogger) (*Server, error) {
+func NewServer(c Config, logger *zap.SugaredLogger, loglevelHandler func(w http.ResponseWriter, r *http.Request)) (*Server, error) {
 	s := &Server{
-		logger: logger.With("component", "metris"),
+		logger:          logger,
+		ProfServer:      &http.Server{},
+		loglevelHandler: loglevelHandler,
 	}
 
 	tlsConfig := &tls.Config{}
@@ -83,15 +89,28 @@ func NewServer(c Config, logger *zap.SugaredLogger) (*Server, error) {
 	}
 
 	router := http.NewServeMux()
-	router.Handle("/metrics", promhttp.Handler())
 	router.Handle("/healthz", s.HealthHandler())
+	router.Handle("/metrics", promhttp.Handler())
+
+	if loglevelHandler != nil {
+		router.HandleFunc("/~/loglevel", s.loglevelHandler)
+	}
 
 	// adding go profiling tools
-	router.HandleFunc("/debug/pprof/", pprof.Index)
-	router.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	router.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	router.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	router.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	if c.ProfilerPort > 0 {
+		profRouter := http.NewServeMux()
+		profRouter.HandleFunc("/debug/pprof/", pprof.Index)
+		profRouter.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		profRouter.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		profRouter.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		profRouter.HandleFunc("/debug/pprof/trace", pprof.Trace)
+
+		// for security reason only listen on localhost
+		s.ProfServer = &http.Server{
+			Addr:    fmt.Sprintf("localhost:%d", c.ProfilerPort),
+			Handler: profRouter,
+		}
+	}
 
 	s.Server = &http.Server{
 		Addr:      c.ListenAddr,
@@ -118,22 +137,29 @@ func (s *Server) Start(parentctx context.Context, parentwg *sync.WaitGroup) {
 		s.Stop()
 	}()
 
-	proto := "http"
-	if s.useTLS {
-		proto = "https"
-	}
-
-	s.logger.Infof("Starting and listening on %s://%s", proto, s.Server.Addr)
-
 	atomic.StoreInt32(&s.Healthy, 1)
 
+	if s.ProfServer.Addr != "" {
+		s.logger.Infof("listening (http/pprof) on %s", s.ProfServer.Addr)
+
+		go func() {
+			if err := s.ProfServer.ListenAndServe(); err != http.ErrServerClosed {
+				s.logger.Fatalf("listening on %s failed: %v", s.ProfServer.Addr, err)
+			}
+		}()
+	}
+
 	if s.useTLS {
+		s.logger.Infof("listening (https) on %s", s.Server.Addr)
+
 		if err := s.Server.ListenAndServeTLS("", ""); err != http.ErrServerClosed {
-			s.logger.Fatalf("Could not listen on %s://%s: %v\n", proto, s.Server.Addr, err)
+			s.logger.Fatalf("listening on %s failed: %v", s.Server.Addr, err)
 		}
 	} else {
+		s.logger.Infof("listening (http) on %s", s.Server.Addr)
+
 		if err := s.Server.ListenAndServe(); err != http.ErrServerClosed {
-			s.logger.Fatalf("Could not listen on %s://%s: %v\n", proto, s.Server.Addr, err)
+			s.logger.Fatalf("listening on %s failed: %v", s.Server.Addr, err)
 		}
 	}
 }
@@ -153,6 +179,14 @@ func (s *Server) Stop() {
 			s.logger.Panic("Timeout while stopping the server, killing instance!")
 		}
 	}(ctx)
+
+	if s.ProfServer.Addr != "" {
+		s.ProfServer.SetKeepAlivesEnabled(false)
+
+		if err := s.ProfServer.Shutdown(ctx); err != nil {
+			s.logger.Errorf("Could not gracefully shutdown the pprof: %v\n", err)
+		}
+	}
 
 	s.Server.SetKeepAlivesEnabled(false)
 

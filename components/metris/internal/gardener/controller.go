@@ -6,14 +6,12 @@ import (
 	"sync"
 	"time"
 
-	gclientset "github.com/gardener/gardener/pkg/client/core/clientset/versioned"
 	ginformers "github.com/gardener/gardener/pkg/client/core/informers/externalversions"
-	shootsinformer "github.com/gardener/gardener/pkg/client/core/informers/externalversions/core/v1beta1"
 	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	kubeinformers "k8s.io/client-go/informers"
-	secretsinformer "k8s.io/client-go/informers/core/v1"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
 )
 
@@ -21,52 +19,36 @@ const (
 	labelAccountID       = "account"
 	labelSubAccountID    = "subaccount"
 	labelHyperscalerType = "hyperscalerType"
-	labelTenantName      = "tenantName"
 
 	fieldSecretBindingName = "spec.secretBindingName"
+	fieldCloudProfileName  = "spec.cloudProfileName"
 
 	defaultResyncPeriod = time.Second * 30
 )
 
-// Account is a representation of the skr accounts
-type Account struct {
-	Name           string
-	ProviderType   string
-	AccountID      string
-	SubAccountID   string
-	TechnicalID    string
-	TenantName     string
-	CredentialName string
-	CredentialData map[string][]byte
-}
-
-// Controller is the controller that watch for shoots and secrets
-type Controller struct {
-	providertype            string
-	gclientset              gclientset.Interface
-	kclientset              kubernetes.Interface
-	gardenerInformerFactory ginformers.SharedInformerFactory
-	kubeInformerFactory     kubeinformers.SharedInformerFactory
-	shootInformer           shootsinformer.ShootInformer
-	secretInformer          secretsinformer.SecretInformer
-	accountsChan            chan<- *Account
-	logger                  *zap.SugaredLogger
-	shootQueue              map[string]bool
-}
-
-// NewController return a new controller for watching shoots and secrets
-func NewController(client *Client, provider string, accountsChan chan<- *Account, logger *zap.SugaredLogger) (*Controller, error) {
+// NewController return a new controller for watching shoots and secrets.
+func NewController(client *Client, provider string, clusterChannel chan<- *Cluster, logger *zap.SugaredLogger) (*Controller, error) {
 	gardenerInformerFactory := ginformers.NewSharedInformerFactoryWithOptions(
-		client.GardenerClientset,
+		client.GClientset,
 		defaultResyncPeriod,
 		ginformers.WithNamespace(client.Namespace),
+		ginformers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			opts.FieldSelector = fields.SelectorFromSet(fields.Set{fieldCloudProfileName: provider}).String()
+		}),
 	)
 
+	hyperscalertype := provider
+	if hyperscalertype == "az" {
+		hyperscalertype = "azure"
+	}
+
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
-		client.KubernetesClientset,
+		client.KClientset,
 		defaultResyncPeriod,
 		kubeinformers.WithNamespace(client.Namespace),
-		kubeinformers.WithTweakListOptions(func(opts *metav1.ListOptions) { opts.LabelSelector = labelHyperscalerType }),
+		kubeinformers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+			opts.LabelSelector = labels.SelectorFromSet(labels.Set{labelHyperscalerType: hyperscalertype}).String()
+		}),
 	)
 
 	shootInformer := gardenerInformerFactory.Core().V1beta1().Shoots()
@@ -74,34 +56,31 @@ func NewController(client *Client, provider string, accountsChan chan<- *Account
 
 	controller := &Controller{
 		providertype:            strings.ToLower(provider),
-		gclientset:              client.GardenerClientset,
-		kclientset:              client.KubernetesClientset,
+		client:                  client,
 		gardenerInformerFactory: gardenerInformerFactory,
 		kubeInformerFactory:     kubeInformerFactory,
 		shootInformer:           shootInformer,
 		secretInformer:          secretInformer,
-		accountsChan:            accountsChan,
-		logger:                  logger.With("component", "gardener"),
-		shootQueue:              make(map[string]bool),
+		clusterChannel:          clusterChannel,
+		logger:                  logger,
 	}
 
 	// Set up event handlers for Shoot resources
 	shootInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    controller.shootAddHandlerFunc,
-		UpdateFunc: controller.shootUpdateFunc,
+		UpdateFunc: controller.shootUpdateHandlerFunc,
 		DeleteFunc: controller.shootDeleteHandlerFunc,
 	})
 
 	// Set up event handler for Secret resources
 	secretInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		UpdateFunc: controller.secretUpdateFunc,
+		UpdateFunc: controller.secretUpdateHandlerFunc,
 	})
 
 	return controller, nil
 }
 
-// Run will set up the event handlers for secrets and shoots, as well
-// as syncing informer caches.
+// Run will set up the event handlers for secrets and shoots, as well as syncing informer caches.
 func (c *Controller) Run(parentCtx context.Context, parentwg *sync.WaitGroup) {
 	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()

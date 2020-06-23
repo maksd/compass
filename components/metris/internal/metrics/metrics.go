@@ -6,8 +6,7 @@ import (
 )
 
 const (
-	metricsNamespace          = "metris"
-	workqueueMetricsNamespace = metricsNamespace + "_workqueue"
+	metricsNamespace = "metris"
 )
 
 var (
@@ -20,11 +19,20 @@ var (
 		[]string{"reason"},
 	)
 
-	StoredAccounts = prometheus.NewGauge(
+	ProviderAPIErrorVec = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: metricsNamespace,
+			Name:      "provider_api_error_total",
+			Help:      "Total number of failed api call.",
+		},
+		[]string{"reason"},
+	)
+
+	StoredClusters = prometheus.NewGauge(
 		prometheus.GaugeOpts{
 			Namespace: metricsNamespace,
-			Name:      "account_total",
-			Help:      "Total number of account added to the storage.",
+			Name:      "cluster_stored",
+			Help:      "Number of cluster saved into the storage.",
 		},
 	)
 
@@ -73,7 +81,8 @@ var (
 	// Definition of metrics for provider queue
 	workqueueDepthMetricVec = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: workqueueMetricsNamespace,
+			Namespace: metricsNamespace,
+			Subsystem: "workqueue",
 			Name:      "depth",
 			Help:      "Current depth of the work queue.",
 		},
@@ -81,7 +90,8 @@ var (
 	)
 	workqueueAddsMetricVec = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
-			Namespace: workqueueMetricsNamespace,
+			Namespace: metricsNamespace,
+			Subsystem: "workqueue",
 			Name:      "items_total",
 			Help:      "Total number of items added to the work queue.",
 		},
@@ -89,7 +99,8 @@ var (
 	)
 	workqueueLatencyMetricVec = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
-			Namespace:  workqueueMetricsNamespace,
+			Namespace:  metricsNamespace,
+			Subsystem:  "workqueue",
 			Name:       "latency_seconds",
 			Help:       "How long an item stays in the work queue.",
 			Objectives: map[float64]float64{},
@@ -98,7 +109,8 @@ var (
 	)
 	workqueueUnfinishedWorkSecondsMetricVec = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: workqueueMetricsNamespace,
+			Namespace: metricsNamespace,
+			Subsystem: "workqueue",
 			Name:      "unfinished_work_seconds",
 			Help:      "How long an item has remained unfinished in the work queue.",
 		},
@@ -106,7 +118,8 @@ var (
 	)
 	workqueueLongestRunningProcessorMetricVec = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Namespace: workqueueMetricsNamespace,
+			Namespace: metricsNamespace,
+			Subsystem: "workqueue",
 			Name:      "longest_running_processor_seconds",
 			Help:      "Duration of the longest running processor in the work queue.",
 		},
@@ -114,13 +127,35 @@ var (
 	)
 	workqueueWorkDurationMetricVec = prometheus.NewSummaryVec(
 		prometheus.SummaryOpts{
-			Namespace:  workqueueMetricsNamespace,
+			Namespace:  metricsNamespace,
+			Subsystem:  "workqueue",
 			Name:       "work_duration_seconds",
 			Help:       "How long processing an item from the work queue takes.",
 			Objectives: map[float64]float64{},
 		},
 		[]string{"queue_name"},
 	)
+
+	// register prometheus metrics
+	_ = func() struct{} {
+		prometheus.MustRegister(
+			ClusterSyncFailureVec,
+			ProviderAPIErrorVec,
+			StoredClusters,
+			ReceivedSamples,
+			ReceivedSamplesDuration,
+			SentSamples,
+			SentSamplesDuration,
+			FailedSamples,
+			workqueueDepthMetricVec,
+			workqueueAddsMetricVec,
+			workqueueLatencyMetricVec,
+			workqueueWorkDurationMetricVec,
+			workqueueUnfinishedWorkSecondsMetricVec,
+			workqueueLongestRunningProcessorMetricVec,
+		)
+		return struct{}{}
+	}()
 )
 
 // Definition of dummy metric used as a placeholder if we don't want to observe some data.
@@ -161,22 +196,4 @@ func (f *WorkqueueMetricsProvider) NewLongestRunningProcessorSecondsMetric(name 
 func (WorkqueueMetricsProvider) NewRetriesMetric(name string) workqueue.CounterMetric {
 	// Retries are not used so the metric is omitted.
 	return noopMetric{}
-}
-
-func init() {
-	prometheus.MustRegister(
-		ClusterSyncFailureVec,
-		StoredAccounts,
-		ReceivedSamples,
-		ReceivedSamplesDuration,
-		SentSamples,
-		SentSamplesDuration,
-		FailedSamples,
-		workqueueDepthMetricVec,
-		workqueueAddsMetricVec,
-		workqueueLatencyMetricVec,
-		workqueueWorkDurationMetricVec,
-		workqueueUnfinishedWorkSecondsMetricVec,
-		workqueueLongestRunningProcessorMetricVec,
-	)
 }

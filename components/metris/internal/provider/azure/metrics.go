@@ -2,90 +2,22 @@ package azure
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"math"
 	"strconv"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2019-12-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2019-12-01/network"
-	"github.com/Azure/azure-sdk-for-go/services/preview/monitor/mgmt/2019-06-01/insights"
-	"github.com/kyma-incubator/compass/components/metris/internal/metrics"
+	"github.com/Azure/azure-sdk-for-go/profiles/latest/compute/mgmt/compute"
+	"github.com/Azure/azure-sdk-for-go/profiles/latest/network/mgmt/network"
+	"github.com/Azure/azure-sdk-for-go/profiles/preview/preview/monitor/mgmt/insights"
 	"github.com/kyma-incubator/compass/components/metris/internal/utils"
-	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 )
 
-const (
-	tagNameSubAccountID string = "SubAccountID"
-
-	capMemoryGB = "MemoryGB"
-	capvCPUs    = "vCPUs"
-
-	diskSizeFactor float64 = 32
-
-	intervalPT5M = 5 * time.Minute
-)
-
-// gatherMetrics - collect results from different Azure API and create edp events.
-func (a *Provider) gatherMetrics(ctx context.Context, workerlogger *zap.SugaredLogger, shootname string) {
-	defer utils.TrackTime("gatherMetrics", time.Now(), workerlogger)
-
-	a.mu.RLock()
-	client, ok := a.clients[shootname]
-	a.mu.RUnlock()
-
-	if !ok {
-		workerlogger.Error("client config not found")
-		return
-	}
-
-	var (
-		subaccountid              = client.Account.SubAccountID
-		resourceGroupName         = client.Account.TechnicalID
-		eventHubResourceGroupName = ""
-		event                     = &Event{
-			Timestamp:      time.Now().Format(time.RFC3339),
-			ResourceGroups: []string{resourceGroupName},
-		}
-	)
-
-	metricTimer := prometheus.NewTimer(metrics.ReceivedSamplesDuration)
-	defer metricTimer.ObserveDuration()
-
-	workerlogger.Debug("getting metrics")
-
-	rgFilter := fmt.Sprintf("tagname eq '%s' and tagvalue eq '%s'", tagNameSubAccountID, subaccountid)
-
-	if ehResourceGroup, err := client.getResourceGroupList(ctx, rgFilter); err == nil && len(ehResourceGroup) > 0 {
-		eventHubResourceGroupName = *ehResourceGroup[0].Name
-		event.ResourceGroups = append(event.ResourceGroups, eventHubResourceGroupName)
-	}
-
-	event.Compute = a.getComputeMetrics(ctx, client, resourceGroupName, workerlogger)
-	event.Networking = a.getNetworkMetrics(ctx, client, resourceGroupName, workerlogger)
-	event.EventHub = a.getEventHubMetrics(ctx, client, eventHubResourceGroupName, workerlogger)
-
-	events := make(Events)
-	events[subaccountid] = make([]*Event, 0)
-	events[subaccountid] = append(events[subaccountid], event)
-
-	metrics.ReceivedSamples.Add(float64(len(events[subaccountid])))
-
-	bufEvent, err := json.Marshal(events)
-	if err != nil {
-		workerlogger.Errorf("error parsing azure events to json: %s", err)
-		return
-	}
-
-	a.eventsChannel <- &bufEvent
-}
-
-func (a *Provider) getComputeMetrics(ctx context.Context, client *Client, resourceGroupName string, logger *zap.SugaredLogger) Compute {
+func (i *Instance) getComputeMetrics(ctx context.Context, resourceGroupName string, logger *zap.SugaredLogger, vmcaps *vmCapabilities) Compute {
 	defer utils.TrackTime("getComputeMetrics", time.Now(), logger)
 
 	var (
+		caps   = *vmcaps
 		vms    []compute.VirtualMachine
 		disks  []compute.Disk
 		cpu    uint64
@@ -103,42 +35,51 @@ func (a *Provider) getComputeMetrics(ctx context.Context, client *Client, resour
 		}
 	)
 
-	vms, err = client.getVirtualMachineList(ctx, resourceGroupName)
+	vms, err = i.client.GetVirtualMachines(ctx, resourceGroupName)
 	if err != nil {
-		logger.Warnf("could not get virtual machines information: %s", err)
-	}
+		logger.Warnf("could not get virtual machines information, using information from last successful event: %s", err)
 
-	vmt := make(map[string]uint32)
-	for _, vm := range vms {
-		vmt[string(vm.HardwareProfile.VMSize)]++
+		result.VMTypes = i.lastEvent.Compute.VMTypes
+		result.ProvisionedCpus = i.lastEvent.Compute.ProvisionedCpus
+		result.ProvisionedRAMGB = i.lastEvent.Compute.ProvisionedRAMGB
+	} else {
+		var vmt = make(map[string]uint32)
 
-		capabilities, caperr := client.getVirtualMachineCapabilities(ctx, vm.HardwareProfile.VMSize)
-		if caperr != nil {
-			logger.Warnf("could not get vm capabilities: %s", err)
-			continue
-		}
+		for _, vm := range vms {
+			vmtype := string(vm.HardwareProfile.VMSize)
+			vmt[vmtype]++
 
-		for _, v := range *capabilities {
-			switch *v.Name {
-			case capvCPUs:
-				if cpu, err = strconv.ParseUint(*v.Value, 10, 32); err == nil {
+			capabilities, ok := caps[vmtype]
+			if !ok {
+				logger.Errorf("could not get vm capabilities for type %s", vmtype)
+				// todo: add metrics for alerting
+			} else {
+				cpu, err = strconv.ParseUint(capabilities[capvCPUs], 10, 64)
+				if err != nil {
+					logger.Errorf("could not get vm capability %s for type %s: %s", capvCPUs, vmtype, err)
+				} else {
 					result.ProvisionedCpus += uint32(cpu)
 				}
-			case capMemoryGB:
-				if ram, err = strconv.ParseFloat(*v.Value, 64); err == nil {
+
+				ram, err = strconv.ParseFloat(capabilities[capMemoryGB], 64)
+				if err != nil {
+					logger.Errorf("could not get vm capability %s for type %s: %s", capMemoryGB, vmtype, err)
+				} else {
 					result.ProvisionedRAMGB += ram
 				}
 			}
 		}
+
+		for k, v := range vmt {
+			result.VMTypes = append(result.VMTypes, VMType{Name: k, Count: v})
+		}
 	}
 
-	for k, v := range vmt {
-		result.VMTypes = append(result.VMTypes, VMType{Name: k, Count: v})
-	}
-
-	disks, err = client.getDiskList(ctx, resourceGroupName)
+	disks, err = i.client.GetDisks(ctx, resourceGroupName)
 	if err != nil {
-		logger.Warnf("could not get disk information: %s", err)
+		logger.With("error", err).Warn("could not get disk information, getting information from last successful event")
+
+		result.ProvisionedVolumes = i.lastEvent.Compute.ProvisionedVolumes
 	} else {
 		result.ProvisionedVolumes.Count = uint32(len(disks))
 
@@ -151,7 +92,7 @@ func (a *Provider) getComputeMetrics(ctx context.Context, client *Client, resour
 	return result
 }
 
-func (a *Provider) getNetworkMetrics(ctx context.Context, client *Client, resourceGroupName string, logger *zap.SugaredLogger) Networking {
+func (i *Instance) getNetworkMetrics(ctx context.Context, resourceGroupName string, logger *zap.SugaredLogger) Networking {
 	defer utils.TrackTime("getNetworkMetrics", time.Now(), logger)
 
 	var (
@@ -166,23 +107,29 @@ func (a *Provider) getNetworkMetrics(ctx context.Context, client *Client, resour
 		publicIPs []network.PublicIPAddress
 	)
 
-	lbs, err = client.getLoadBalancerList(ctx, resourceGroupName)
+	lbs, err = i.client.GetLoadBalancers(ctx, resourceGroupName)
 	if err != nil {
-		logger.Warnf("could not get loadbalancer infornation: %s", err)
+		logger.With("error", err).Warn("could not get loadbalancer infornation, getting information from last successful event")
+
+		result.ProvisionedLoadBalancers = i.lastEvent.Networking.ProvisionedLoadBalancers
 	} else {
 		result.ProvisionedLoadBalancers += uint32(len(lbs))
 	}
 
-	vnets, err = client.getVirtualNetworkList(ctx, resourceGroupName)
+	vnets, err = i.client.GetVirtualNetworks(ctx, resourceGroupName)
 	if err != nil {
-		logger.Warnf("could not get vnet infornation: %s", err)
+		logger.With("error", err).Warn("could not get vnet infornation, getting information from last successful event")
+
+		result.ProvisionedVnets = i.lastEvent.Networking.ProvisionedVnets
 	} else {
 		result.ProvisionedVnets += uint32(len(vnets))
 	}
 
-	publicIPs, err = client.getPublicIPAddressList(ctx, resourceGroupName)
+	publicIPs, err = i.client.GetPublicIPAddresses(ctx, resourceGroupName)
 	if err != nil {
-		logger.Warnf("could not get public ip infornation: %s", err)
+		logger.With("error", err).Warn("could not get public ip infornation, getting information from last successful event")
+
+		result.ProvisionedIps = i.lastEvent.Networking.ProvisionedIps
 	} else {
 		result.ProvisionedIps += uint32(len(publicIPs))
 	}
@@ -190,7 +137,7 @@ func (a *Provider) getNetworkMetrics(ctx context.Context, client *Client, resour
 	return result
 }
 
-func (a *Provider) getEventHubMetrics(ctx context.Context, client *Client, resourceGroupName string, logger *zap.SugaredLogger) EventHub {
+func (i *Instance) getEventHubMetrics(ctx context.Context, pollinterval time.Duration, resourceGroupName string, logger *zap.SugaredLogger) EventHub {
 	defer utils.TrackTime("getEventHubMetrics", time.Now(), logger)
 
 	var (
@@ -206,41 +153,47 @@ func (a *Provider) getEventHubMetrics(ctx context.Context, client *Client, resou
 	)
 
 	if resourceGroupName == "" {
+		logger.Warn("eventhub namespace is empty, getting information from last successful event")
+
+		result = i.lastEvent.EventHub
+
 		return result
 	}
 
-	ehns, eherr := client.getNamespaceList(ctx, resourceGroupName)
+	ehns, eherr := i.client.GetEHNamespaces(ctx, resourceGroupName)
 	if eherr != nil {
-		logger.Warnf("eventhub namespace error: %s", eherr)
-	}
+		logger.With("error", eherr).Warn("eventhub namespace error, getting information from last successful event")
 
-	result.NumberNamespaces = uint32(len(ehns))
+		result = i.lastEvent.EventHub
+	} else {
+		result.NumberNamespaces = uint32(len(ehns))
 
-	interval := "PT1M"
-	if a.pollinterval == intervalPT5M {
-		interval = "PT5M"
-	}
-
-	for _, ns := range ehns {
-		resourceURI := *ns.ID
-
-		nsmetric, errs := client.getMetricValuesList(ctx, resourceURI, interval, []string{"IncomingBytes", "OutgoingBytes", "IncomingMessages"}, []string{string(insights.Maximum)})
-		if len(errs) > 0 {
-			for _, err := range errs {
-				logger.Warnf("eventhub metric error: %s", err)
-			}
-
-			continue
+		interval := PT1M
+		if pollinterval == intervalPT5M {
+			interval = PT5M
 		}
 
-		if interval == "PT5M" {
-			result.IncomingRequestsPT5M += *nsmetric["IncomingMessages"].Maximum
-			result.MaxIncomingBytesPT5M += *nsmetric["IncomingBytes"].Maximum
-			result.MaxOutgoingBytesPT5M += *nsmetric["OutgoingBytes"].Maximum
-		} else {
-			result.IncomingRequestsPT1M += *nsmetric["IncomingMessages"].Maximum
-			result.MaxIncomingBytesPT1M += *nsmetric["IncomingBytes"].Maximum
-			result.MaxOutgoingBytesPT1M += *nsmetric["OutgoingBytes"].Maximum
+		for _, ns := range ehns {
+			resourceURI := *ns.ID
+
+			nsmetric, errs := i.client.GetMetricValues(ctx, resourceURI, string(interval), []string{"IncomingBytes", "OutgoingBytes", "IncomingMessages"}, []string{string(insights.Maximum)})
+			if len(errs) > 0 {
+				logger.With("errors", errs).Warn("eventhub metric error, getting information from last successful event")
+
+				result = i.lastEvent.EventHub
+
+				continue
+			}
+
+			if interval == PT5M {
+				result.IncomingRequestsPT5M += *nsmetric["IncomingMessages"].Maximum
+				result.MaxIncomingBytesPT5M += *nsmetric["IncomingBytes"].Maximum
+				result.MaxOutgoingBytesPT5M += *nsmetric["OutgoingBytes"].Maximum
+			} else {
+				result.IncomingRequestsPT1M += *nsmetric["IncomingMessages"].Maximum
+				result.MaxIncomingBytesPT1M += *nsmetric["IncomingBytes"].Maximum
+				result.MaxOutgoingBytesPT1M += *nsmetric["OutgoingBytes"].Maximum
+			}
 		}
 	}
 
